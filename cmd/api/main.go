@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,12 +18,16 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type App struct {
 	db        *pgxpool.Pool
 	jwtSecret []byte
+	httpClient *http.Client
+	geminiKey  string
+	geminiModel string
 }
 
 type UserClaims struct {
@@ -30,6 +37,10 @@ type UserClaims struct {
 }
 
 func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Printf("note: no .env loaded (%v) — using process environment only", err)
+	}
+
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -56,7 +67,18 @@ func main() {
 		log.Fatalf("migrations failed: %v", err)
 	}
 
-	app := &App{db: db, jwtSecret: []byte(jwtSecret)}
+	geminiModel := os.Getenv("GEMINI_MODEL")
+	if geminiModel == "" {
+		geminiModel = "gemini-1.5-flash"
+	}
+
+	app := &App{
+		db:         db,
+		jwtSecret:  []byte(jwtSecret),
+		httpClient: &http.Client{Timeout: 20 * time.Second},
+		geminiKey:  strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
+		geminiModel: geminiModel,
+	}
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID, chimw.RealIP, chimw.Logger, chimw.Recoverer, chimw.Timeout(60*time.Second))
 
@@ -468,11 +490,103 @@ func (a *App) summarizeTender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if a.geminiKey != "" {
+		points, err := a.summarizeWithGemini(r.Context(), text)
+		if err == nil && len(points) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"summary_points": points,
+				"source":         "gemini",
+			})
+			return
+		}
+	}
+
 	points := summarizeToBullets(text)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"summary_points": points,
-		"note":           "MVP local summarizer. Replace with LLM API integration later.",
+		"source":         "local_fallback",
 	})
+}
+
+func (a *App) summarizeWithGemini(ctx context.Context, text string) ([]string, error) {
+	prompt := "Summarize this tender description in 3 to 5 short bullet points. Return only bullet lines.\n\n" + text
+	body := map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]string{
+					{"text": prompt},
+				},
+			},
+		},
+		"generationConfig": map[string]any{
+			"temperature":     0.2,
+			"maxOutputTokens": 300,
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", a.geminiModel, a.geminiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("gemini request failed: status %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return nil, err
+	}
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+		return nil, errors.New("empty gemini response")
+	}
+
+	resultText := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
+	if resultText == "" {
+		return nil, errors.New("empty summary text")
+	}
+
+	lines := strings.Split(resultText, "\n")
+	var points []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "-*• ")
+		if line == "" {
+			continue
+		}
+		points = append(points, line)
+		if len(points) == 5 {
+			break
+		}
+	}
+	if len(points) == 0 {
+		return summarizeToBullets(resultText), nil
+	}
+	return points, nil
 }
 
 func summarizeToBullets(text string) []string {

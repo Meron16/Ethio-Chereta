@@ -19,6 +19,7 @@ This is the MVP backend for the Ethio Chereta tender platform, based on your SRS
 - Simple dashboard stats (`open_tenders`, `bids_received`)
 - Basic local tender summarizer endpoint (placeholder for LLM integration)
 - Automatic schema creation on startup
+- AI summarizer via Gemini API (with local fallback)
 
 ## 1) Setup
 
@@ -28,6 +29,8 @@ This is the MVP backend for the Ethio Chereta tender platform, based on your SRS
    - `DATABASE_URL`
    - `JWT_SECRET`
    - `PORT` (optional)
+   - `GEMINI_API_KEY` (optional, enables real AI summarizer)
+   - `GEMINI_MODEL` (optional, default `gemini-1.5-flash`)
 
 ## 2) Install dependencies
 
@@ -56,6 +59,9 @@ Server starts on `http://localhost:8080` by default.
 - `POST /api/v1/tenders/{id}/award` (admin)
 - `GET /api/v1/dashboard` (admin)
 - `POST /api/v1/ai/summarize` (auth)
+
+If `GEMINI_API_KEY` is set, `/api/v1/ai/summarize` uses Gemini.
+If not set (or if Gemini fails), it automatically falls back to a local summarizer.
 
 ## Example request payloads
 
